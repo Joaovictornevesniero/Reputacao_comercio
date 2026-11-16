@@ -1,0 +1,7 @@
+edge_profile_maps/
+perfil_*/
+__pycache__/
+.venv/
+debug_maps.png
+debug_maps.html
+*.xlsx

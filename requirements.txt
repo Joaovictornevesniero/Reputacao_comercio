@@ -1,0 +1,6 @@
+streamlit
+pandas
+altair
+ollama
+selenium
+xlsxwriter
