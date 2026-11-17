@@ -10,6 +10,9 @@ from scraper import coletar_avaliacoes_maps
 
 MODELO_OLLAMA = "gemma3:4b"
 VERDE = "#6FCF97"
+OPCOES_OLLAMA = {"num_ctx": 16384}  # janela de contexto maior para caber as avaliações
+MAX_AVALIACOES_IA = 150             # a IA lê só as 150 mais recentes
+MAX_CARACTERES_COMENTARIO = 300
 
 PERIODOS = {
     "Desde o início": None,
@@ -20,16 +23,22 @@ PERIODOS = {
     "Último mês": 30,
 }
 
+PERGUNTAS_SUGERIDAS = [
+    "Qual é a principal reclamação dos clientes?",
+    "O que os clientes mais elogiam?",
+    "O atendimento está melhorando ou piorando?",
+]
+
 st.set_page_config(page_title="Raio-X de Reputação com IA", layout="wide")
 
 st.title("Raio-X de Reputação de Comércios (Google Maps + IA)")
-st.markdown("Cole o link de qualquer estabelecimento no Google Maps para extrair avaliações e gerar um plano de melhoria.")
+st.markdown("Cole o link de qualquer estabelecimento no Google Maps para extrair as avaliações mais recentes, gerar um plano de melhoria e tirar dúvidas com a IA.")
 
 col_input, col_qtd = st.columns([4, 1])
 with col_input:
     url_maps = st.text_input("Link do estabelecimento no Google Maps:", placeholder="https://www.google.com/maps/place/...")
 with col_qtd:
-    qtd_reviews = st.number_input("Qtd. avaliações", min_value=5, max_value=200, value=15, step=5)
+    qtd_reviews = st.number_input("Últimas avaliações (máx. 500)", min_value=5, max_value=500, value=50, step=5)
 
 
 def gerar_excel(df: pd.DataFrame, diagnostico: str) -> bytes:
@@ -85,7 +94,7 @@ def serie_diaria(df: pd.DataFrame):
     idx = pd.date_range(s.index.min().normalize(), max(s.index.max().normalize(), hoje), freq="D")
     s = s.reindex(idx)
     s["total"] = s["total"].ffill()
-    s["media"] = s["media"].interpolate(method="time")  # liga os pontos de forma contínua
+    s["media"] = s["media"].interpolate(method="time")
     s = s.rename_axis("data").reset_index()
     s["media"] = s["media"].round(3)
     return s
@@ -105,7 +114,6 @@ def grafico_evolucao(df: pd.DataFrame, dias):
     span = (s["data"].max() - s["data"].min()).days
     formato_x = "%d/%m" if span <= 200 else "%m/%Y"
 
-    # zoom no eixo Y para a variação ficar visível
     ymin = max(1.0, math.floor((s["media"].min() - 0.1) * 10) / 10)
     ymax = min(5.0, math.ceil((s["media"].max() + 0.1) * 10) / 10)
     if ymax - ymin < 0.3:
@@ -128,7 +136,6 @@ def grafico_evolucao(df: pd.DataFrame, dias):
         ),
     ).encode(y=y)
 
-    # hover em QUALQUER posição do gráfico (há um ponto por dia)
     hover = alt.selection_point(fields=["data"], nearest=True, on="mouseover",
                                 empty=False, clear="mouseout")
 
@@ -149,32 +156,61 @@ def grafico_evolucao(df: pd.DataFrame, dias):
     return (area + seletor + ponto + regua).properties(height=350)
 
 
+def montar_contexto(df: pd.DataFrame) -> str:
+    """Texto com as avaliações mais recentes, usado como base para a IA."""
+    linhas = []
+    for _, r in df.head(MAX_AVALIACOES_IA).iterrows():
+        quando = r["data_texto"] or "data desconhecida"
+        comentario = str(r["comentario"])[:MAX_CARACTERES_COMENTARIO]
+        linhas.append(f"- [{r['nota']} estrelas | {quando}]: {comentario}")
+    return "\n".join(linhas)
+
+
+def responder_pergunta(contexto: str, historico: list, pergunta: str):
+    """Gera a resposta em streaming, com base apenas nas avaliações coletadas."""
+    sistema = (
+        "Você é um consultor especialista em gestão de comércios e negócios locais. "
+        "Responda sempre em português, de forma direta e objetiva, baseando-se ESTRITAMENTE "
+        "nas avaliações de clientes abaixo. Se a resposta não puder ser encontrada nelas, "
+        "diga isso claramente em vez de inventar. Sempre que possível, cite exemplos "
+        "curtos das avaliações e dê recomendações práticas.\n\n"
+        f"AVALIAÇÕES DOS CLIENTES:\n{contexto}"
+    )
+    mensagens = [{"role": "system", "content": sistema}]
+    mensagens += historico[-6:]
+    mensagens.append({"role": "user", "content": pergunta})
+
+    try:
+        for parte in ollama.chat(model=MODELO_OLLAMA, messages=mensagens,
+                                 options=OPCOES_OLLAMA, stream=True):
+            yield parte["message"]["content"]
+    except Exception as e:
+        yield f"Erro ao conectar no Ollama. Verifique se ele está rodando. Detalhe: {e}"
+
+
 # ---------------- Coleta ----------------
 if st.button("Analisar Estabelecimento", type="primary"):
     if not url_maps:
         st.warning("Cole um link válido do Google Maps primeiro.")
     else:
-        with st.spinner("Coletando avaliações reais do Google Maps..."):
+        with st.spinner("Coletando as avaliações mais recentes do Google Maps... (pode levar alguns minutos)"):
             dados = coletar_avaliacoes_maps(url_maps, limite=qtd_reviews)
 
         if not dados:
-            st.session_state.pop("df", None)
-            st.session_state.pop("diagnostico", None)
+            for chave in ("df", "diagnostico", "contexto", "chat"):
+                st.session_state.pop(chave, None)
             st.error("Não foi possível extrair comentários desse link. Veja o terminal para detalhes do erro.")
         else:
             df = pd.DataFrame(dados)
             df["data"] = pd.to_datetime(df["data"], errors="coerce")
+            contexto = montar_contexto(df)
 
-            texto_avaliacoes = "\n".join(
-                f"- [{r['nota']} estrelas | {r['data_texto'] or 'data desconhecida'}]: {r['comentario']}"
-                for _, r in df.iterrows()
-            )
             prompt = f"""
             Você é um consultor especialista em gestão de comércios e negócios locais
             (restaurantes, lojas, serviços, clínicas, academias etc.).
             Analise as seguintes avaliações reais de clientes coletadas do Google Maps:
 
-            {texto_avaliacoes}
+            {contexto}
 
             Com base estritamente nesses relatos, entregue em português:
             1. **Principais Pontos Fortes** (o que os clientes mais elogiam).
@@ -183,15 +219,19 @@ if st.button("Analisar Estabelecimento", type="primary"):
             """
             with st.spinner(f"Gerando insights com Ollama ({MODELO_OLLAMA})..."):
                 try:
-                    resposta = ollama.chat(model=MODELO_OLLAMA, messages=[{"role": "user", "content": prompt}])
+                    resposta = ollama.chat(model=MODELO_OLLAMA,
+                                           messages=[{"role": "user", "content": prompt}],
+                                           options=OPCOES_OLLAMA)
                     diagnostico = resposta["message"]["content"]
                 except Exception as e:
                     diagnostico = f"Erro ao conectar no Ollama. Verifique se ele está rodando. Detalhe: {e}"
 
             st.session_state["df"] = df
             st.session_state["diagnostico"] = diagnostico
+            st.session_state["contexto"] = contexto
+            st.session_state["chat"] = []
 
-# ---------------- Exibição (persiste após o download) ----------------
+# ---------------- Exibição (persiste após cada interação) ----------------
 if "df" in st.session_state:
     df = st.session_state["df"]
     diagnostico = st.session_state["diagnostico"]
@@ -202,6 +242,9 @@ if "df" in st.session_state:
     k2.metric("Nota Média (Amostra)", f"{df['nota'].mean():.1f} / 5.0")
     positivos = len(df[df["nota"] >= 4])
     k3.metric("Taxa de Satisfação (4-5 ★)", f"{(positivos / len(df)) * 100:.0f}%")
+
+    if len(df) > MAX_AVALIACOES_IA:
+        st.caption(f"Gráficos e Excel usam as {len(df)} avaliações. A IA analisa as {MAX_AVALIACOES_IA} mais recentes.")
 
     col_graf, col_tab = st.columns(2)
 
@@ -246,6 +289,42 @@ if "df" in st.session_state:
     st.divider()
     st.subheader("Diagnóstico Executivo & Plano de Ação (IA)")
     st.markdown(diagnostico)
+
+    # ---------------- Pergunte à IA ----------------
+    st.divider()
+    st.subheader("Pergunte à IA sobre este negócio")
+    st.caption("Faça qualquer pergunta sobre as avaliações coletadas. A IA responde apenas com base nelas.")
+
+    if "chat" not in st.session_state:
+        st.session_state["chat"] = []
+
+    cols_sug = st.columns(len(PERGUNTAS_SUGERIDAS))
+    for i, texto in enumerate(PERGUNTAS_SUGERIDAS):
+        if cols_sug[i].button(texto, key=f"sug_{i}", use_container_width=True):
+            st.session_state["pergunta_pendente"] = texto
+
+    for msg in st.session_state["chat"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pergunta = st.chat_input("Ex.: O que os clientes reclamam sobre o atendimento?")
+    if not pergunta:
+        pergunta = st.session_state.pop("pergunta_pendente", None)
+
+    if pergunta:
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+        with st.chat_message("assistant"):
+            resposta = st.write_stream(
+                responder_pergunta(st.session_state["contexto"], st.session_state["chat"], pergunta)
+            )
+        st.session_state["chat"].append({"role": "user", "content": pergunta})
+        st.session_state["chat"].append({"role": "assistant", "content": resposta})
+
+    if st.session_state["chat"]:
+        if st.button("Limpar conversa"):
+            st.session_state["chat"] = []
+            st.rerun()
 
     st.divider()
     st.download_button(
